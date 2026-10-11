@@ -39,7 +39,7 @@ def notebook(cells):
 LLM_MD_INTRO = r"""
 # 🧠 Colab → Hermes: LLM-сервер (vLLM)
 
-Этот ноутбук поднимает на видеокарте Google Colab **настоящий LLM-сервер** (открытая модель Qwen2.5), делает для него публичную ссылку и сам себя проверяет. Ссылку потом подключаем к Hermes — и модель из Colab доступна как обычная модель.
+Этот ноутбук поднимает на видеокарте Google Colab **настоящий LLM-сервер** (открытая модель Qwen2.5, контекст 65 536 токенов), делает для него публичную ссылку и сам себя проверяет. Ссылку потом подключаем к Hermes — и модель из Colab доступна как обычная модель.
 
 **Как запустить:**
 1. Меню **Среда выполнения → Сменить тип среды выполнения → аппаратный ускоритель: T4 GPU** → Сохранить.
@@ -49,7 +49,8 @@ LLM_MD_INTRO = r"""
 **Что важно знать:**
 - Бесплатная Colab иногда не даёт GPU. Если в ячейке «2. Проверка GPU» написано «НЕ НАЙДЕН» — проверь шаг 1.
 - Сессия живёт до ~12 часов (обычно меньше). Умерла сессия → просто «Выполнить все» заново, ссылка будет новая.
-- Ноутбук — на T4 (16 ГБ) крутится модель 7B. На платных GPU (L4 / A100) ноутбук сам выберет модель крупнее.
+- Ноутбук сам расширяет контекст модели до 65k (YaRN) — меньше нельзя: **Hermes принимает как основную модель только сервер с контекстом ≥ 64k**.
+- На T4 (16 ГБ) крутится модель 7B. На платных GPU (L4 / A100) ноутбук сам выберет модель крупнее.
 - Одновременно только один GPU-ноутбук: либо этот, либо «картиночный». Оба сразу — только на платных GPU.
 
 **Пресеты моделей (меняются в ячейке 1):**
@@ -68,7 +69,7 @@ LLM_MD_INTRO = r"""
 LLM_CELL_SETTINGS = r"""
 # ==== НАСТРОЙКИ (обычно менять не нужно) ====
 MODEL_PRESET = "auto"   # "auto" | "7b" | "14b" | "32b" | "vision"
-MAX_MODEL_LEN = 32768   # контекст в токенах (снизь до 16384, если совсем мало видеопамяти)
+MAX_MODEL_LEN = 65536   # контекст в токенах. Hermes требует >= 64k у основной модели — ниже не ставь
 PORT = 8000             # локальный порт сервера
 
 print("Настройки загружены. Пресет модели:", MODEL_PRESET)
@@ -92,20 +93,24 @@ m = re.search(r"([0-9]+)\s*MiB", gpu_info)
 VRAM_GB = (int(m.group(1)) / 1024.0) if m else 16.0
 
 PRESETS = {
-    "7b":     ("Qwen/Qwen2.5-7B-Instruct-AWQ",    32768),
-    "14b":    ("Qwen/Qwen2.5-14B-Instruct-AWQ",   32768),
-    "32b":    ("Qwen/Qwen2.5-32B-Instruct-AWQ",   32768),
-    "vision": ("Qwen/Qwen2.5-VL-7B-Instruct-AWQ", 32768),
+    "7b":     "Qwen/Qwen2.5-7B-Instruct-AWQ",
+    "14b":    "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    "32b":    "Qwen/Qwen2.5-32B-Instruct-AWQ",
+    "vision": "Qwen/Qwen2.5-VL-7B-Instruct-AWQ",
 }
 if MODEL_PRESET == "auto":
     _preset = "7b" if VRAM_GB < 20 else ("14b" if VRAM_GB < 38 else "32b")
 else:
     _preset = MODEL_PRESET
 
-MODEL_ID, _native_len = PRESETS[_preset]
-MAX_LEN = min(MAX_MODEL_LEN, _native_len)
+MODEL_ID = PRESETS[_preset]
+MAX_LEN = MAX_MODEL_LEN
 MODEL_NAME = "colab-llm"
-print("Видеопамять ≈ %.0f ГБ → пресет '%s' → %s (контекст %d)" % (VRAM_GB, _preset, MODEL_ID, MAX_LEN))
+print("Видеопамять ≈ %.0f ГБ → пресет '%s' → %s" % (VRAM_GB, _preset, MODEL_ID))
+if MAX_LEN < 65536:
+    print("⚠️ Внимание: MAX_MODEL_LEN =", MAX_LEN, "— меньше 64k, Hermes не примет сервер как ОСНОВНУЮ модель.")
+else:
+    print("Контекст:", MAX_LEN, "токенов (Qwen2.5 нативно 32k — расширяю YaRN, фактор 2.0)")
 """
 
 LLM_CELL_INSTALL = r"""
@@ -126,55 +131,84 @@ else:
 """
 
 LLM_CELL_START = r"""
-import os, sys, time, subprocess, secrets
+import os, sys, time, json, subprocess, secrets
 
 API_KEY = globals().get("API_KEY") or ("sk-colab-" + secrets.token_hex(12))
 os.makedirs("/content/logs", exist_ok=True)
-VLLM_LOG = "/content/logs/vllm.log"
 
 env = os.environ.copy()
 env["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 env["VLLM_NO_USAGE_STATS"] = "1"
 
-cmd = [
-    sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-    "--model", MODEL_ID,
-    "--served-model-name", MODEL_NAME,
-    "--dtype", "float16",
-    "--max-model-len", str(MAX_LEN),
-    "--gpu-memory-utilization", "0.90",
-    "--api-key", API_KEY,
-    "--enable-auto-tool-choice",
-    "--tool-call-parser", "hermes",
-    "--enforce-eager",
-    "--port", str(PORT),
-]
-if _preset == "vision":
-    cmd += ["--limit-mm-per-prompt", "image=4"]
+def base_cmd(max_len):
+    cmd = [
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", MODEL_ID,
+        "--served-model-name", MODEL_NAME,
+        "--dtype", "float16",
+        "--max-model-len", str(max_len),
+        "--gpu-memory-utilization", "0.90",
+        "--api-key", API_KEY,
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", "hermes",
+        "--enforce-eager",
+        "--port", str(PORT),
+    ]
+    if _preset == "vision":
+        cmd += ["--limit-mm-per-prompt", "image=4"]
+    if ("L4" in gpu_info or "L40" in gpu_info) and _preset in ("14b", "32b"):
+        cmd += ["--kv-cache-dtype", "fp8"]   # экономия видеопамяти на Ada (L4/L40)
+    return cmd
 
-print("Запускаю сервер. Первый раз качается модель (~5 ГБ) — это 2–6 минут. Жди...")
-with open(VLLM_LOG, "w") as lf:
-    proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, env=env)
+# Qwen2.5 нативно держит 32k; для 65k расширяем через YaRN.
+# Разные версии vLLM принимают расширение по-разному — пробуем по очереди.
+YARN = {"rope_type": "yarn", "factor": 2.0,
+        "original_max_position_embeddings": 32768, "rope_theta": 1000000}
 
-deadline = time.time() + 1200
+attempts = []
+if MAX_LEN >= 65536:
+    attempts.append(("hf_overrides", ["--hf-overrides", json.dumps({"rope_parameters": YARN})], MAX_LEN))
+    attempts.append(("rope_scaling", ["--rope-scaling", json.dumps(YARN)], MAX_LEN))
+attempts.append(("plain", [], min(MAX_LEN, 32768)))
+
 ok = False
-while time.time() < deadline:
-    log = open(VLLM_LOG, errors="ignore").read()
-    if ("Application startup complete" in log) or ("Uvicorn running on" in log):
-        ok = True
+last_log = None
+for tag, extra, mlen in attempts:
+    if tag == "plain" and MAX_LEN > 32768:
+        print("⚠️ Расширение контекста не завелось — поднимаю как есть, 32768 токенов.")
+        print("   Сервер будет работать, но Hermes НЕ примет его как основную модель (нужно ≥64k).")
+    print("Запускаю (%s), контекст %d. Первый запуск качает модель (~5 ГБ) — 2–6 минут..." % (tag, mlen))
+    last_log = "/content/logs/vllm_%s.log" % tag
+    with open(last_log, "w") as lf:
+        proc = subprocess.Popen(base_cmd(mlen) + extra, stdout=lf, stderr=subprocess.STDOUT,
+                                env=env, start_new_session=True)
+    deadline = time.time() + 1200
+    while time.time() < deadline:
+        log = open(last_log, errors="ignore").read()
+        if ("Application startup complete" in log) or ("Uvicorn running on" in log):
+            ok = True
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(5)
+    if ok:
+        print("✅ LLM-сервер запущен (контекст %d, порт %d)" % (mlen, PORT))
+        if mlen < 65536:
+            print("⚠️ Контекст ниже 64k — в Hermes это не основная модель, а вспомогательная/через API.")
         break
-    if proc.poll() is not None:
-        break
+    print("   вариант «%s» не поднялся, пробую следующий..." % tag)
+    try:
+        os.killpg(os.getpgid(proc.pid), 15)   # прибираем процесс и его детей
+    except Exception:
+        pass
     time.sleep(5)
 
-if ok:
-    print("✅ LLM-сервер запущен локально на порту", PORT)
-else:
-    print("❌ Сервер не стартовал. Последние строки лога:")
-    print(open(VLLM_LOG, errors="ignore").read()[-2500:])
+if not ok:
+    print("❌ Ни один вариант не запустился. Последний лог (%s):" % last_log)
+    print(open(last_log, errors="ignore").read()[-2500:])
     raise RuntimeError(
-        "vLLM не запустился. Варианты: 1) выполни ячейку «АЛЬТЕРНАТИВА: Ollama» в конце; "
-        "2) Среда выполнения → Перезапустить сессию → Выполнить все ещё раз."
+        "vLLM не запустился. Выполни ячейку «АЛЬТЕРНАТИВА: Ollama» в конце ноутбука "
+        "(предварительно: Среда выполнения → Перезапустить сессию)."
     )
 """
 
@@ -244,6 +278,8 @@ LLM_MD_FALLBACK = r"""
 ## АЛЬТЕРНАТИВА: Ollama (если vLLM не завёлся)
 
 Если предыдущие ячейки упали с ошибкой — выполни **только эту ячейку** (она самодостаточная: поставит Ollama, скачает модель 7B и поднимет туннель). Учти: перед этим лучше сделать **Среда выполнения → Перезапустить сессию**.
+
+У Ollama контекст до 32k — как ОСНОВНУЮ модель Hermes её не примет (нужно ≥64k), но напрямую через API это полностью рабочая модель.
 """
 
 LLM_CELL_OLLAMA = r"""
@@ -261,6 +297,7 @@ os.makedirs("/content/ollama_models", exist_ok=True)
 env = os.environ.copy()
 env["OLLAMA_MODELS"] = "/content/ollama_models"
 env["OLLAMA_HOST"] = "127.0.0.1:%d" % PORT
+env["OLLAMA_CONTEXT_LENGTH"] = "32768"
 with open("/content/logs/ollama.log", "w") as lf:
     subprocess.Popen(["ollama", "serve"], stdout=lf, stderr=subprocess.STDOUT, env=env)
 time.sleep(5)
@@ -316,6 +353,8 @@ LLM_MD_FAQ = r"""
 
 - **«Нет GPU»** → Среда выполнения → Сменить тип среды выполнения → **T4 GPU** → Сохранить, и «Выполнить все» заново.
 - **vLLM упал** → запасная ячейка «АЛЬТЕРНАТИВА: Ollama» (или Перезапустить сессию и ещё раз).
+- **Написало «сервер поднялся с 32768»** → YaRN-расширение не сработало; попробуй Перезапустить сессию → Выполнить все. Если повторяется — используй Ollama-ячейку.
+- **Hermes пишет, что модель не принимается (контекст < 64k)** → то же самое: сервер должен подняться с 65536; см. пункт выше.
 - **Colab пишет, что функция недоступна / не даёт GPU совсем** → включи VPN и перезапусти сессию.
 - **Хочу другую модель** → поменяй `MODEL_PRESET` в ячейке 1 и «Выполнить все» (модель скачается заново).
 - **Ссылка перестала работать** → сессия Colab умерла. Это норма: «Выполнить все» заново и пришли новый блок в Hermes.

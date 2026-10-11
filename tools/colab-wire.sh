@@ -49,7 +49,7 @@ echo "→ MODEL: $MODEL"
 "$HERMES_BIN" config set providers.colab.api "$URL/v1"
 "$HERMES_BIN" config set providers.colab.default_model "$MODEL"
 "$HERMES_BIN" config set providers.colab.key_env COLAB_API_KEY
-"$HERMES_BIN" config set providers.colab.context_length 32768
+"$HERMES_BIN" config set providers.colab.context_length 65536
 if [ -n "$KEY" ]; then "$HERMES_BIN" config set COLAB_API_KEY "$KEY"; fi
 
 echo "→ Проверяю связь..."
